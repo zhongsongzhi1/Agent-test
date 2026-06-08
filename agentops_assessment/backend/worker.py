@@ -51,7 +51,7 @@ def execute_run(run_id: str) -> None:
 
     # execute plan
     # prepare executor context: include sku, prompt, user_permissions
-    context = {"prompt": prompt, "user_permissions": user.get("permissions", []) if user else []}
+    context = {"prompt": prompt, "user_permissions": user.get("permissions", []) if user else [], "user": user}
     state = executor.execute(run_id, plan, context)
 
     # executor already updates runs; ensure final audit

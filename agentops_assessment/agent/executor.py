@@ -85,6 +85,65 @@ class Executor:
             if step.tool_name == "knowledge.search":
                 inputs.setdefault("user_permissions", context.get("user_permissions", []))
 
+            # derive required permissions for tool
+            tool_permission_map = {
+                "oa.create_approval_draft": ["oa:approval:write"],
+                "knowledge.search": ["knowledge:read"],
+                "erp.get_inventory": ["erp:read"],
+                "bi.get_sales": ["bi:read"],
+                "supplier.get_risk": ["supplier:read"],
+            }
+            required_perms = tool_permission_map.get(step.tool_name, [])
+            missing_perms = [p for p in required_perms if p not in context.get("user_permissions", [])]
+            if missing_perms:
+                # write skipped step_state and run_event, and write audit log
+                with database.connect() as conn:
+                    database.init_db(conn)
+                    conn.execute(
+                        """
+                        INSERT INTO step_states (run_id, step_id, tool_name, status, attempt, input_json, output_json, started_at, finished_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            step.id,
+                            step.tool_name,
+                            "skipped",
+                            0,
+                            database.encode_json(_sanitize_dict(inputs)),
+                            database.encode_json({}),
+                            database.now_iso(),
+                            database.now_iso(),
+                        ),
+                    )
+                    database.insert_run_event(
+                        conn,
+                        run_id,
+                        "tool.skipped",
+                        {
+                            "step_id": step.id,
+                            "tool_name": step.tool_name,
+                            "reason": "missing_permission",
+                            "missing_permissions": missing_perms,
+                        },
+                        tool_name=step.tool_name,
+                    )
+                    # write audit log for denial
+                    actor_id = context.get("user", {}).get("id") if context.get("user") else "system"
+                    database.insert_audit_log(
+                        conn,
+                        actor_id=actor_id,
+                        action="tool.execution.denied",
+                        resource=run_id,
+                        payload={"tool_name": step.tool_name, "missing_permissions": missing_perms},
+                        decision="deny",
+                    )
+
+                state.steps[idx].status = "skipped"
+                state.steps[idx].error = f"missing_permissions: {missing_perms}"
+                self.state_store.save(state)
+                continue
+
             # call tool
             try:
                 result = self.registry.call(step.tool_name, inputs)
@@ -113,6 +172,10 @@ class Executor:
                         ),
                     )
                     # insert run event
+                    # estimate token cost (placeholder heuristic)
+                    token_cost = max(1, len(database.encode_json(sanitized_input)) // 50)
+                    attempts = getattr(self.registry, "last_call_attempts", {}).get(step.tool_name, 1)
+                    retries = max(0, attempts - 1)
                     database.insert_run_event(
                         conn,
                         run_id,
@@ -123,12 +186,40 @@ class Executor:
                             "input_summary": sanitized_input,
                             "output_summary": sanitized_output,
                             "error": None,
-                            "attempt": getattr(self.registry, "last_call_attempts", {}).get(step.tool_name, 1),
-                            "retries": 0,
-                            "token_cost": 0,
+                            "attempt": attempts,
+                            "retries": retries,
+                            "token_cost": token_cost,
                         },
                         tool_name=step.tool_name,
                     )
+                    # record per-tool token cost
+                    conn.execute(
+                        """
+                        INSERT INTO tool_call_costs (run_id, tool_name, token_cost, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (run_id, step.tool_name, token_cost, database.now_iso()),
+                    )
+                    total_token_cost += token_cost
+                    # insert audit log for allowed tool call
+                    actor_id = context.get("user", {}).get("id") if context.get("user") else "system"
+                    try:
+                        database.insert_audit_log(
+                            conn,
+                            actor_id=actor_id,
+                            action="tool.call",
+                            resource=run_id,
+                            payload={
+                                "step_id": step.id,
+                                "tool_name": step.tool_name,
+                                "token_cost": token_cost,
+                                "input_summary": sanitized_input,
+                            },
+                            decision="allow",
+                        )
+                    except Exception:
+                        # do not fail execution if audit logging fails
+                        pass
 
                 # update in-memory state
                 state.steps[idx].status = "succeeded"
@@ -147,6 +238,12 @@ class Executor:
 
             except Exception as exc:  # pragma: no cover - best-effort error capture
                 err_msg = str(exc)
+                sanitized_input = _sanitize_dict(inputs)
+                # estimate token cost even for failed calls
+                token_cost = max(1, len(database.encode_json(sanitized_input)) // 50)
+                attempts = getattr(self.registry, "last_call_attempts", {}).get(step.tool_name, 1)
+                retries = max(0, attempts - 1)
+                
                 with database.connect() as conn:
                     database.init_db(conn)
                     # record failed step
@@ -160,8 +257,8 @@ class Executor:
                             step.id,
                             step.tool_name,
                             "failed",
-                            getattr(self.registry, "last_call_attempts", {}).get(step.tool_name, 1),
-                            database.encode_json(_sanitize_dict(inputs)),
+                            attempts,
+                            database.encode_json(sanitized_input),
                             database.encode_json({}),
                             err_msg,
                             database.now_iso(),
@@ -175,15 +272,43 @@ class Executor:
                         {
                             "step_id": step.id,
                             "tool_name": step.tool_name,
-                            "input_summary": _sanitize_dict(inputs),
+                            "input_summary": sanitized_input,
                             "output_summary": {},
                             "error": {"message": err_msg},
-                            "attempt": getattr(self.registry, "last_call_attempts", {}).get(step.tool_name, 1),
-                            "retries": 0,
-                            "token_cost": 0,
+                            "attempt": attempts,
+                            "retries": retries,
+                            "token_cost": token_cost,
                         },
                         tool_name=step.tool_name,
                     )
+                    # record per-tool token cost even for failed calls
+                    conn.execute(
+                        """
+                        INSERT INTO tool_call_costs (run_id, tool_name, token_cost, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (run_id, step.tool_name, token_cost, database.now_iso()),
+                    )
+                    total_token_cost += token_cost
+                    # write audit log for failed tool call
+                    try:
+                        actor_id = context.get("user", {}).get("id") if context.get("user") else "system"
+                        database.insert_audit_log(
+                            conn,
+                            actor_id=actor_id,
+                            action="tool.call",
+                            resource=run_id,
+                            payload={
+                                "step_id": step.id,
+                                "tool_name": step.tool_name,
+                                "token_cost": token_cost,
+                                "input_summary": sanitized_input,
+                                "error": err_msg,
+                            },
+                            decision="deny",
+                        )
+                    except Exception:
+                        pass
 
                 state.status = "failed"
                 state.steps[idx].status = "failed"

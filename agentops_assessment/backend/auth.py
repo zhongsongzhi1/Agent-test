@@ -42,8 +42,21 @@ def require_permissions(*permissions: str):
     def dependency(user: dict = Depends(get_current_user)) -> dict:
         missing = [p for p in permissions if p not in user["permissions"]]
         if missing:
-            # TODO(candidate/P1): 权限拒绝也要写入审计日志，尤其是 mallory 创建任务
-            # 这类入口拒绝；日志载荷只能包含脱敏后的 actor、缺失权限和资源线索。
+            # P1: 在权限拒绝路径写入审计日志
+            try:
+                with database.connect() as conn:
+                    database.init_db(conn)
+                    database.insert_audit_log(
+                        conn,
+                        actor_id=user.get("id", "unknown"),
+                        action="permission.denied",
+                        resource="permission_check",
+                        payload={"missing_permissions": missing},
+                        decision="deny",
+                    )
+            except Exception:
+                # 不应因日志写入失败而改变原始行为；吞掉并继续抛出权限拒绝
+                pass
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"missing_permissions": missing},

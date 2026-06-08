@@ -47,21 +47,47 @@ class KnowledgeIndex:
                 FROM knowledge_chunks
                 """
             ).fetchall()
+        # 权限过滤：只有当用户拥有 chunk.permission 或 chunk.permission == 'knowledge:read' 时可见
+        accessible = []
+        filtered_doc_ids = set()
+        q_tokens = tokenize(query)
+        scored = []
+        for row in rows:
+            perm = row["permission"]
+            if perm == "knowledge:read" or perm in user_permissions:
+                content = f"{row['title']} {row['content'] or ''}"
+                score = cosine_score(q_tokens, tokenize(content))
+                scored.append((score, row))
+            else:
+                filtered_doc_ids.add(row["doc_id"])
 
-        filtered_doc_ids = sorted(
+        # 按相关性排序并选 top_k
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [r for s, r in scored[:top_k] if s > 0]
+
+        citations = [
             {
-                row["doc_id"]
-                for row in rows
-                if row["permission"] not in user_permissions and row["permission"] != "knowledge:read"
+                "doc_id": row["doc_id"],
+                "title": row["title"],
+                "source_path": row["source_path"],
+                "chunk_id": row["id"],
             }
-        )
-        # 占位实现故意不返回有效答案，直到候选人完成测试要求的检索和重排行为。
+            for row in top
+        ]
+
+        
+        if top:
+            snippets = []
+            for row in top:
+                text = (row["content"] or "").strip()
+                snippet = text[:200]
+                snippets.append(f"{row['title']}: {snippet}")
+            answer = "\n".join(snippets)
+        else:
+            answer = ""
+
         return {
-            "answer": "",
-            "citations": [],
-            "filtered_doc_ids": filtered_doc_ids,
-            "debug": {
-                "candidate_note": "TODO(candidate/P1): 按查询相关性排序 chunk，并生成答案。",
-                "available_chunks": len(rows),
-            },
+            "answer": answer,
+            "citations": citations,
+            "filtered_doc_ids": sorted(filtered_doc_ids),
         }

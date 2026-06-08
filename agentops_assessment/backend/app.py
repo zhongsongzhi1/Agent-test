@@ -18,6 +18,7 @@ from agentops_assessment.backend.schemas import (
 )
 from agentops_assessment.backend.worker import execute_run
 from agentops_assessment.rag.search import KnowledgeIndex
+from agentops_assessment.rag.security import detect_prompt_injection
 
 
 def _task_from_row(row) -> TaskOut:
@@ -52,7 +53,28 @@ def create_app() -> FastAPI:
         body: TaskCreate,
         user: dict = Depends(require_permissions("tasks:create")),
     ) -> TaskOut:
-        # TODO(candidate/P1): 增加提示词注入检查，并记录拒绝类审计日志。
+        # P1: 提示词注入检测
+        matches = detect_prompt_injection(body.prompt or "")
+        if matches:
+            # 记录拒绝审计日志并拒绝创建
+            with database.connect() as conn:
+                database.init_db(conn)
+                database.insert_audit_log(
+                    conn,
+                    actor_id=user["id"],
+                    action="task.rejected",
+                    resource="task.create",
+                    payload={
+                        "reason": "prompt_injection_detected",
+                        "matched_patterns": matches,
+                        "truncated_prompt": (body.prompt or "")[:200],
+                    },
+                    decision="deny",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="提示词注入检测未通过，任务已被拒绝。",
+            )
         task_id = str(uuid.uuid4())
         now = database.now_iso()
         with database.connect() as conn:
