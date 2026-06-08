@@ -94,6 +94,36 @@ def init_db(conn: sqlite3.Connection) -> None:
             content TEXT NOT NULL,
             embedding_json TEXT
         );
+        
+        CREATE TABLE IF NOT EXISTS step_states (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            tool_name TEXT,
+            status TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            input_json TEXT,
+            output_json TEXT,
+            error TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            FOREIGN KEY(run_id) REFERENCES runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_step_states_run ON step_states(run_id);
+
+        CREATE TABLE IF NOT EXISTS tool_call_costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            token_cost INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_costs_run ON tool_call_costs(run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id);
         """
     )
     conn.commit()
